@@ -90,16 +90,17 @@ CREATE INDEX IF NOT EXISTS idx_trucks_active
 -- 4. PRODUCTS & DELIVERY HUBS: ZERO-PRICE SUPPORT & SOFT DELETE ALIGNMENT
 -- ------------------------------------------------------------------------------
 ALTER TABLE public.products
-    ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'Tube',
-    ADD COLUMN IF NOT EXISTS sack_size TEXT DEFAULT '50kg Big Sack',
+    ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'Medium',
+    ADD COLUMN IF NOT EXISTS sack_size TEXT DEFAULT 'Medium',
+    ADD COLUMN IF NOT EXISTS image_url TEXT DEFAULT NULL,
     ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL,
     ADD COLUMN IF NOT EXISTS deleted_by TEXT DEFAULT NULL;
 
 UPDATE public.products
 SET
-    category = COALESCE(NULLIF(category, ''), NULLIF(description, ''), 'Tube'),
-    description = COALESCE(NULLIF(description, ''), NULLIF(category, ''), 'Tube'),
-    sack_size = COALESCE(NULLIF(sack_size, ''), COALESCE(sack_weight_kg::INT::TEXT, '50') || 'kg Sack')
+    category = COALESCE(NULLIF(category, ''), NULLIF(sack_size, ''), NULLIF(description, ''), 'Medium'),
+    description = COALESCE(NULLIF(sack_size, ''), NULLIF(description, ''), 'Medium'),
+    sack_size = COALESCE(NULLIF(sack_size, ''), COALESCE(sack_weight_kg::INT::TEXT, 'Medium'))
 WHERE category IS NULL OR sack_size IS NULL;
 
 -- Ensure standard_price allows >= 0 (no negative prices)
@@ -108,8 +109,15 @@ ALTER TABLE public.products ADD CONSTRAINT products_standard_price_check CHECK (
 
 ALTER TABLE public.delivery_hubs
     ADD COLUMN IF NOT EXISTS zone TEXT DEFAULT 'City Proper',
+    ADD COLUMN IF NOT EXISTS photo_url TEXT DEFAULT NULL,
     ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL,
     ADD COLUMN IF NOT EXISTS deleted_by TEXT DEFAULT NULL;
+
+ALTER TABLE public.trucks
+    ADD COLUMN IF NOT EXISTS image_url TEXT DEFAULT NULL;
+
+ALTER TABLE public.user_accounts
+    ADD COLUMN IF NOT EXISTS photo_url TEXT DEFAULT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_products_active
     ON public.products (id) WHERE deleted_at IS NULL AND is_active = true;
@@ -609,7 +617,48 @@ END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
 -- ------------------------------------------------------------------------------
--- 8. SUPABASE REALTIME PUBLICATION FOR LIVE WEB & MOBILE SYNC
+-- 8. SUPABASE STORAGE BUCKET (jica-assets) & FREE-TIER IMAGE POLICIES
+-- ------------------------------------------------------------------------------
+INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+VALUES (
+    'jica-assets',
+    'jica-assets',
+    true,
+    5242880, -- 5 MB hard upper ceiling; web uploads pre-compress to ~40-100 KB WebP/JPEG
+    ARRAY['image/webp', 'image/jpeg', 'image/png']
+)
+ON CONFLICT (id) DO UPDATE SET
+    public = true,
+    file_size_limit = 5242880,
+    allowed_mime_types = ARRAY['image/webp', 'image/jpeg', 'image/png'];
+
+DROP POLICY IF EXISTS "Public access to jica-assets" ON storage.objects;
+DROP POLICY IF EXISTS "Allow authenticated/service upload to jica-assets" ON storage.objects;
+DROP POLICY IF EXISTS "Allow update/delete to jica-assets" ON storage.objects;
+DROP POLICY IF EXISTS "jica_assets_public_read" ON storage.objects;
+DROP POLICY IF EXISTS "jica_assets_public_insert" ON storage.objects;
+DROP POLICY IF EXISTS "jica_assets_public_update" ON storage.objects;
+DROP POLICY IF EXISTS "jica_assets_public_delete" ON storage.objects;
+
+CREATE POLICY "jica_assets_public_read"
+ON storage.objects FOR SELECT
+USING (bucket_id = 'jica-assets');
+
+CREATE POLICY "jica_assets_public_insert"
+ON storage.objects FOR INSERT
+WITH CHECK (bucket_id = 'jica-assets');
+
+CREATE POLICY "jica_assets_public_update"
+ON storage.objects FOR UPDATE
+USING (bucket_id = 'jica-assets')
+WITH CHECK (bucket_id = 'jica-assets');
+
+CREATE POLICY "jica_assets_public_delete"
+ON storage.objects FOR DELETE
+USING (bucket_id = 'jica-assets');
+
+-- ------------------------------------------------------------------------------
+-- 9. SUPABASE REALTIME PUBLICATION FOR LIVE WEB & MOBILE SYNC
 -- ------------------------------------------------------------------------------
 DO $$
 DECLARE

@@ -111,6 +111,39 @@ def round_currency(value: Any) -> float:
 def is_uuid(val: Optional[str]) -> bool:
     return bool(val and UUID_REGEX.match(str(val).strip()))
 
+JICA_ASSETS_BUCKET = "jica-assets"
+
+def sanitize_image_url(url: Optional[str]) -> Optional[str]:
+    if url is None:
+        return None
+    clean = str(url).strip()
+    if not clean:
+        return None
+    if clean.lower().startswith("data:"):
+        raise HTTPException(
+            status_code=400,
+            detail="Base64 image data is not permitted in PostgreSQL. Upload photos to Supabase Storage jica-assets first."
+        )
+    return clean
+
+def extract_jica_asset_path(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    marker = f"/storage/v1/object/public/{JICA_ASSETS_BUCKET}/"
+    idx = url.find(marker)
+    if idx == -1:
+        return None
+    return url[idx + len(marker):].split("?")[0]
+
+def delete_jica_asset_url(url: Optional[str]) -> None:
+    path = extract_jica_asset_path(url)
+    if not path:
+        return
+    try:
+        supabase.storage.from_(JICA_ASSETS_BUCKET).remove([path])
+    except Exception as e:
+        print(f"[STORAGE CLEANUP NOTICE] {e}")
+
 def get_truck_lock(truck_id: str) -> threading.Lock:
     with _truck_locks_guard:
         if truck_id not in _truck_locks:
@@ -218,8 +251,8 @@ class TruckUpdateRequest(BaseModel):
 class ProductCreateRequest(BaseModel):
     id: Optional[str] = None
     name: str = Field(..., min_length=1, max_length=120)
-    category: str = Field(default="Tube")
-    sack_size: str = Field(default="50kg Big Sack")
+    category: Optional[str] = None
+    sack_size: str = Field(default="Medium")
     standard_price: float = Field(default=0.0, ge=0.0)
     image_url: Optional[str] = None
 
@@ -229,6 +262,23 @@ class ProductUpdateRequest(BaseModel):
     sack_size: Optional[str] = None
     standard_price: Optional[float] = Field(default=None, ge=0.0)
     image_url: Optional[str] = None
+
+class HubCreateRequest(BaseModel):
+    id: Optional[str] = None
+    name: str = Field(..., min_length=1, max_length=120)
+    address: str = Field(default="Cagayan de Oro City")
+    latitude: float = Field(..., ge=-90.0, le=90.0)
+    longitude: float = Field(..., ge=-180.0, le=180.0)
+    zone: str = Field(default="City Proper")
+    photo_url: Optional[str] = None
+
+class HubUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    address: Optional[str] = None
+    latitude: Optional[float] = Field(default=None, ge=-90.0, le=90.0)
+    longitude: Optional[float] = Field(default=None, ge=-180.0, le=180.0)
+    zone: Optional[str] = None
+    photo_url: Optional[str] = None
 
 class DispatchItemPayload(BaseModel):
     idempotency_key: Optional[str] = None
@@ -989,6 +1039,7 @@ def create_user(req: UserAccountCreate):
         hashed = hash_password(raw_pass)
         clean_username = req.username.strip().lower() if req.username else req.full_name.strip().lower().replace(" ", "")
 
+        safe_photo = sanitize_image_url(req.photo_url)
         payload: Dict[str, Any] = {
             "full_name": req.full_name.strip(),
             "role": req.role,
@@ -999,7 +1050,7 @@ def create_user(req: UserAccountCreate):
             "phone_number": req.phone_number,
             "email": req.email,
             "assigned_truck_id": req.assigned_truck_id or None,
-            "photo_url": req.photo_url,
+            "photo_url": safe_photo,
             "is_active": True
         }
         if req.id and is_uuid(req.id):
@@ -1019,6 +1070,12 @@ def create_user(req: UserAccountCreate):
 @app.put("/api/v1/users/{user_id}")
 def update_user(user_id: str, req: UserAccountUpdate):
     try:
+        old_photo = None
+        if req.photo_url is not None:
+            prev = supabase.table("user_accounts").select("photo_url").eq("id", user_id).limit(1).execute()
+            if prev.data:
+                old_photo = prev.data[0].get("photo_url")
+
         update_data: Dict[str, Any] = {}
         if req.full_name is not None: update_data["full_name"] = req.full_name.strip()
         if req.role is not None: update_data["role"] = req.role
@@ -1026,7 +1083,9 @@ def update_user(user_id: str, req: UserAccountUpdate):
         if req.phone_number is not None: update_data["phone_number"] = req.phone_number
         if req.email is not None: update_data["email"] = req.email
         if req.assigned_truck_id is not None: update_data["assigned_truck_id"] = req.assigned_truck_id or None
-        if req.photo_url is not None: update_data["photo_url"] = req.photo_url
+        if req.photo_url is not None:
+            new_photo = sanitize_image_url(req.photo_url)
+            update_data["photo_url"] = new_photo
         if req.is_active is not None: update_data["is_active"] = req.is_active
         if req.password:
             update_data["password_hash"] = hash_password(req.password)
@@ -1039,9 +1098,14 @@ def update_user(user_id: str, req: UserAccountUpdate):
         if not res.data:
             raise HTTPException(status_code=404, detail="User account not found.")
 
+        if req.photo_url is not None and old_photo and old_photo != update_data.get("photo_url"):
+            delete_jica_asset_url(old_photo)
+
         log_audit("user_accounts", user_id, "UPDATE_USER", "Admin")
         safe_user = {k: v for k, v in res.data[0].items() if k not in ("password", "password_hash", "mobile_pin")}
         return {"status": "success", "user": safe_user}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1050,7 +1114,14 @@ def update_user(user_id: str, req: UserAccountUpdate):
 @app.get("/api/v1/products")
 def get_products():
     try:
-        res = supabase.table("products").select("*").eq("is_active", True).is_("deleted_at", "null").order("created_at").execute()
+        res = (
+            supabase.table("products")
+            .select("id, code, name, category, description, sack_size, sack_weight_kg, standard_price, image_url, created_at")
+            .eq("is_active", True)
+            .is_("deleted_at", "null")
+            .order("created_at")
+            .execute()
+        )
         return {"status": "success", "data": res.data or []}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1059,43 +1130,70 @@ def get_products():
 def create_product(req: ProductCreateRequest):
     try:
         prod_id = req.id if (req.id and is_uuid(req.id)) else str(uuid.uuid4())
+        clean_sack = (req.sack_size or "Medium").strip()
+        compat_cat = (req.category or clean_sack).strip()
+        safe_img = sanitize_image_url(req.image_url)
         payload = {
             "id": prod_id,
             "code": f"PROD-{prod_id[:8].upper()}",
             "name": req.name.strip(),
-            "description": req.category,
-            "category": req.category,
-            "sack_size": req.sack_size,
+            "description": clean_sack,
+            "category": compat_cat,
+            "sack_size": clean_sack,
             "standard_price": round_currency(req.standard_price),
-            "image_url": req.image_url,
+            "image_url": safe_img,
             "is_active": True
         }
         res = supabase.table("products").insert(payload).execute()
         return {"status": "success", "data": res.data[0] if res.data else payload}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/api/v1/products/{product_id}")
 def update_product(product_id: str, req: ProductUpdateRequest):
     try:
+        old_img = None
+        if req.image_url is not None:
+            prev = supabase.table("products").select("image_url").eq("id", product_id).limit(1).execute()
+            if prev.data:
+                old_img = prev.data[0].get("image_url")
+
         updates: Dict[str, Any] = {}
         if req.name is not None: updates["name"] = req.name.strip()
-        if req.category is not None:
+        if req.sack_size is not None:
+            clean_sack = req.sack_size.strip()
+            updates["sack_size"] = clean_sack
+            updates["description"] = clean_sack
+            updates["category"] = req.category or clean_sack
+        elif req.category is not None:
             updates["category"] = req.category
             updates["description"] = req.category
-        if req.sack_size is not None: updates["sack_size"] = req.sack_size
         if req.standard_price is not None: updates["standard_price"] = round_currency(max(0.0, req.standard_price))
-        if req.image_url is not None: updates["image_url"] = req.image_url
+        if req.image_url is not None:
+            updates["image_url"] = sanitize_image_url(req.image_url)
 
         res = supabase.table("products").update(updates).eq("id", product_id).execute()
+        if req.image_url is not None and old_img and old_img != updates.get("image_url"):
+            delete_jica_asset_url(old_img)
         return {"status": "success", "data": res.data[0] if res.data else updates}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/trucks")
 def get_trucks():
     try:
-        res = supabase.table("trucks").select("*").eq("is_active", True).is_("deleted_at", "null").order("id").execute()
+        res = (
+            supabase.table("trucks")
+            .select("id, plate_number, model, sack_capacity, max_sack_capacity, image_url, is_active")
+            .eq("is_active", True)
+            .is_("deleted_at", "null")
+            .order("id")
+            .execute()
+        )
         return {"status": "success", "data": res.data or []}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1104,36 +1202,48 @@ def get_trucks():
 def create_truck(req: TruckUpsertRequest):
     try:
         clean_id = req.id.strip().upper()
+        safe_img = sanitize_image_url(req.image_url)
         payload = {
             "id": clean_id,
             "plate_number": req.plate_number.strip().upper(),
             "model": req.model.strip(),
             "sack_capacity": req.sack_capacity,
             "max_sack_capacity": req.sack_capacity,
-            "image_url": req.image_url,
+            "image_url": safe_img,
             "is_active": True,
             "deleted_at": None,
             "deleted_by": None
         }
         res = supabase.table("trucks").upsert(payload, on_conflict="id").execute()
         return {"status": "success", "data": res.data[0] if res.data else payload}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/api/v1/trucks/{truck_id}")
 def update_truck(truck_id: str, req: TruckUpdateRequest):
     try:
+        old_img = None
+        if req.image_url is not None:
+            prev = supabase.table("trucks").select("image_url").eq("id", truck_id).limit(1).execute()
+            if prev.data:
+                old_img = prev.data[0].get("image_url")
+
         updates: Dict[str, Any] = {}
         if req.plate_number is not None: updates["plate_number"] = req.plate_number.strip().upper()
         if req.model is not None: updates["model"] = req.model.strip()
         if req.sack_capacity is not None:
             updates["sack_capacity"] = req.sack_capacity
             updates["max_sack_capacity"] = req.sack_capacity
-        if req.image_url is not None: updates["image_url"] = req.image_url
+        if req.image_url is not None:
+            updates["image_url"] = sanitize_image_url(req.image_url)
 
         res = supabase.table("trucks").update(updates).eq("id", truck_id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Truck not found.")
+        if req.image_url is not None and old_img and old_img != updates.get("image_url"):
+            delete_jica_asset_url(old_img)
         return {"status": "success", "data": res.data[0]}
     except HTTPException:
         raise
@@ -1144,7 +1254,14 @@ def update_truck(truck_id: str, req: TruckUpdateRequest):
 def get_trucks_capacity():
     """Returns live capacity, active loaded sacks, remaining sacks, and in-transit status per active truck."""
     try:
-        trucks_res = supabase.table("trucks").select("*").eq("is_active", True).is_("deleted_at", "null").order("id").execute()
+        trucks_res = (
+            supabase.table("trucks")
+            .select("id, plate_number, model, sack_capacity, max_sack_capacity")
+            .eq("is_active", True)
+            .is_("deleted_at", "null")
+            .order("id")
+            .execute()
+        )
         trucks = trucks_res.data or []
 
         slips_res = supabase.table("load_slips").select("id, truck_id, status, total_loaded_sacks, date").is_("deleted_at", "null").execute()
@@ -1187,8 +1304,67 @@ def get_trucks_capacity():
 @app.get("/api/v1/hubs")
 def get_hubs():
     try:
-        res = supabase.table("delivery_hubs").select("*").eq("is_active", True).is_("deleted_at", "null").order("name").execute()
+        res = (
+            supabase.table("delivery_hubs")
+            .select("id, code, name, address, latitude, longitude, zone, photo_url")
+            .eq("is_active", True)
+            .is_("deleted_at", "null")
+            .order("name")
+            .execute()
+        )
         return {"status": "success", "data": res.data or []}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/hubs")
+def create_hub(req: HubCreateRequest):
+    try:
+        hub_id = req.id if (req.id and is_uuid(req.id)) else str(uuid.uuid4())
+        safe_photo = sanitize_image_url(req.photo_url)
+        payload = {
+            "id": hub_id,
+            "code": f"HUB-{hub_id[:8].upper()}",
+            "name": req.name.strip(),
+            "address": req.address.strip(),
+            "latitude": req.latitude,
+            "longitude": req.longitude,
+            "zone": req.zone or "City Proper",
+            "photo_url": safe_photo,
+            "is_active": True
+        }
+        res = supabase.table("delivery_hubs").insert(payload).execute()
+        return {"status": "success", "data": res.data[0] if res.data else payload}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/v1/hubs/{hub_id}")
+def update_hub(hub_id: str, req: HubUpdateRequest):
+    try:
+        old_photo = None
+        if req.photo_url is not None:
+            prev = supabase.table("delivery_hubs").select("photo_url").eq("id", hub_id).limit(1).execute()
+            if prev.data:
+                old_photo = prev.data[0].get("photo_url")
+
+        updates: Dict[str, Any] = {}
+        if req.name is not None: updates["name"] = req.name.strip()
+        if req.address is not None: updates["address"] = req.address.strip()
+        if req.latitude is not None: updates["latitude"] = req.latitude
+        if req.longitude is not None: updates["longitude"] = req.longitude
+        if req.zone is not None: updates["zone"] = req.zone
+        if req.photo_url is not None:
+            updates["photo_url"] = sanitize_image_url(req.photo_url)
+
+        res = supabase.table("delivery_hubs").update(updates).eq("id", hub_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Delivery hub not found.")
+        if req.photo_url is not None and old_photo and old_photo != updates.get("photo_url"):
+            delete_jica_asset_url(old_photo)
+        return {"status": "success", "data": res.data[0]}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1735,7 +1911,7 @@ def get_live_fleet_telemetry():
     try:
         slips_res = (
             supabase.table("load_slips")
-            .select("*, load_slip_items(*, delivery_hubs(*)), trucks(id, plate_number, model)")
+            .select("id, slip_number, truck_id, truck_plate, driver_id, driver_name, status, total_loaded_sacks, total_delivered_sacks, updated_at, trucks(id, plate_number, model), load_slip_items(id, status, delivered_qty, hub_name, customer_name, delivery_hubs(name, latitude, longitude))")
             .is_("deleted_at", "null")
             .order("created_at", desc=True)
             .execute()
@@ -1743,7 +1919,13 @@ def get_live_fleet_telemetry():
         all_slips = slips_res.data or []
         active_slips = [s for s in all_slips if is_unremitted_status(s.get("status"))]
 
-        gps_res = supabase.table("gps_logs").select("*").order("logged_at", desc=True).limit(100).execute()
+        gps_res = (
+            supabase.table("gps_logs")
+            .select("truck_id, latitude, longitude, speed_kmh, heading, logged_at")
+            .order("logged_at", desc=True)
+            .limit(100)
+            .execute()
+        )
         latest_gps_by_truck: Dict[str, Dict[str, Any]] = {}
         for g in (gps_res.data or []):
             tid = g.get("truck_id")
@@ -1880,6 +2062,20 @@ def soft_delete_item(req: SoftDeleteRequest):
         if req.entity_type in ("trucks", "products", "delivery_hubs", "customers", "user_accounts"):
             update_fields["is_active"] = False
 
+        # Clean up Supabase Storage image asset on delete so 1 GB storage quota is protected
+        asset_col_map = {
+            "products": "image_url",
+            "trucks": "image_url",
+            "delivery_hubs": "photo_url",
+            "user_accounts": "photo_url"
+        }
+        asset_col = asset_col_map.get(req.entity_type)
+        if asset_col:
+            prev = supabase.table(req.entity_type).select(asset_col).eq("id", req.entity_id).limit(1).execute()
+            if prev.data and prev.data[0].get(asset_col):
+                delete_jica_asset_url(prev.data[0].get(asset_col))
+                update_fields[asset_col] = None
+
         supabase.table(req.entity_type).update(update_fields).eq("id", req.entity_id).execute()
         log_audit(req.entity_type, req.entity_id, "SOFT_DELETE", req.deleted_by)
         return {"status": "success", "message": f"{req.entity_type} item safely archived to Trash."}
@@ -1916,6 +2112,19 @@ def delete_forever(req: PermanentDeleteRequest):
             raise HTTPException(status_code=403, detail="Permanent deletion is strictly restricted to the Owner role.")
         admin_name = admin_res.data[0].get("full_name", "Owner")
 
+        asset_col_map = {
+            "products": "image_url",
+            "trucks": "image_url",
+            "delivery_hubs": "photo_url",
+            "user_accounts": "photo_url"
+        }
+        asset_col = asset_col_map.get(req.entity_type)
+        stale_asset_url = None
+        if asset_col:
+            prev = supabase.table(req.entity_type).select(asset_col).eq("id", req.entity_id).limit(1).execute()
+            if prev.data:
+                stale_asset_url = prev.data[0].get(asset_col)
+
         if req.entity_type == "load_slips":
             try:
                 supabase.table("load_slip_items").delete().eq("load_slip_id", req.entity_id).execute()
@@ -1932,6 +2141,9 @@ def delete_forever(req: PermanentDeleteRequest):
                     detail="Cannot permanently purge this item because historical Load Slips or Invoices reference it. Keep it safely archived (deactivated) to preserve audit history."
                 )
             raise
+
+        if stale_asset_url:
+            delete_jica_asset_url(stale_asset_url)
 
         log_audit(req.entity_type, req.entity_id, "PERMANENT_DELETE", admin_name)
         return {"status": "success", "message": "Record permanently deleted."}
