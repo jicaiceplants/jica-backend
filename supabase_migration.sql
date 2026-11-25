@@ -294,7 +294,8 @@ LEFT JOIN public.load_slip_items lsi ON lsi.id = inv.load_slip_item_id
 LEFT JOIN public.trucks trk ON trk.id = COALESCE(inv.truck_id, ls.truck_id)
 LEFT JOIN public.user_accounts drv ON drv.id = COALESCE(inv.driver_id, ls.driver_id)
 LEFT JOIN public.user_accounts inc ON inc.id = COALESCE(inv.in_charge_id, ls.in_charge_id)
-WHERE inv.deleted_at IS NULL;
+WHERE inv.deleted_at IS NULL
+  AND UPPER(TRIM(COALESCE(ls.status, ''))) IN ('REMITTED', 'COMPLETED', 'RECONCILED');
 
 -- ------------------------------------------------------------------------------
 -- 7. ATOMIC CONCURRENT DISPATCH RPC (ACID CAPACITY GUARD & ITEMIZED INVOICING)
@@ -658,7 +659,44 @@ ON storage.objects FOR DELETE
 USING (bucket_id = 'jica-assets');
 
 -- ------------------------------------------------------------------------------
--- 9. SUPABASE REALTIME PUBLICATION FOR LIVE WEB & MOBILE SYNC
+-- 9. PERSISTENT EMERGENCY SOS ALERTS (sos_alerts)
+-- ------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.sos_alerts (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT UNIQUE NOT NULL,
+    load_slip_id UUID REFERENCES public.load_slips(id) ON DELETE SET NULL,
+    driver_id TEXT,
+    driver_name TEXT,
+    truck_id TEXT NOT NULL,
+    latitude DOUBLE PRECISION NOT NULL,
+    longitude DOUBLE PRECISION NOT NULL,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'Active',
+    dispatcher_reply TEXT,
+    acknowledged_by TEXT,
+    acknowledged_at TIMESTAMP WITH TIME ZONE,
+    resolved_by TEXT,
+    resolved_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_sos_alerts_status_created
+    ON public.sos_alerts (status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sos_alerts_truck_status
+    ON public.sos_alerts (truck_id, status);
+
+GRANT ALL ON TABLE public.sos_alerts TO postgres, anon, authenticated, service_role;
+
+ALTER TABLE public.sos_alerts ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "jica_sos_alerts_all" ON public.sos_alerts;
+CREATE POLICY "jica_sos_alerts_all"
+ON public.sos_alerts FOR ALL
+USING (true)
+WITH CHECK (true);
+
+-- ------------------------------------------------------------------------------
+-- 10. SUPABASE REALTIME PUBLICATION FOR LIVE WEB & MOBILE SYNC
 -- ------------------------------------------------------------------------------
 DO $$
 DECLARE
@@ -671,7 +709,8 @@ DECLARE
         'load_slips',
         'load_slip_items',
         'invoices',
-        'shift_reconciliations'
+        'shift_reconciliations',
+        'sos_alerts'
     ];
 BEGIN
     FOREACH t_name IN ARRAY realtime_tables

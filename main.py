@@ -163,10 +163,70 @@ REMITTED_OR_DONE_STATUSES = {
     "REMITTED", "COMPLETED", "RECONCILED", "CANCELLED"
 }
 
+APPROVED_RECEIPT_SLIP_STATUSES = {
+    "REMITTED", "COMPLETED", "RECONCILED"
+}
+
+RESOLVED_SOS_STATUSES = {"RESOLVED", "DISMISSED"}
+
 def is_unremitted_status(status_val: Optional[str]) -> bool:
     if not status_val:
         return False
     return status_val.strip().upper() not in REMITTED_OR_DONE_STATUSES
+
+def _duration_to_seconds(val: Any, default: int = 0) -> int:
+    if val is None:
+        return default
+    raw = str(val).strip().rstrip("s")
+    try:
+        return max(0, int(round(float(raw))))
+    except Exception:
+        return default
+
+def decode_polyline(encoded: str) -> List[Dict[str, float]]:
+    """Decodes a Google Encoded Polyline string into [{latitude, longitude}, ...]."""
+    if not encoded:
+        return []
+    coords: List[Dict[str, float]] = []
+    index = 0
+    lat = 0
+    lng = 0
+    length = len(encoded)
+    try:
+        while index < length:
+            shift = 0
+            result = 0
+            while True:
+                b = ord(encoded[index]) - 63
+                index += 1
+                result |= (b & 0x1F) << shift
+                shift += 5
+                if b < 0x20 or index >= length and b >= 0x20:
+                    break
+            dlat = ~(result >> 1) if (result & 1) else (result >> 1)
+            lat += dlat
+
+            if index >= length:
+                break
+            shift = 0
+            result = 0
+            while True:
+                b = ord(encoded[index]) - 63
+                index += 1
+                result |= (b & 0x1F) << shift
+                shift += 5
+                if b < 0x20 or index >= length and b >= 0x20:
+                    break
+            dlng = ~(result >> 1) if (result & 1) else (result >> 1)
+            lng += dlng
+
+            coords.append({
+                "latitude": round(lat / 1e5, 6),
+                "longitude": round(lng / 1e5, 6)
+            })
+    except Exception as poly_err:
+        print(f"[POLYLINE DECODE ERROR] {poly_err}")
+    return coords
 
 # --- PYDANTIC SCHEMAS ---
 
@@ -210,6 +270,15 @@ class SosAcknowledgeRequest(BaseModel):
     alert_id: str = Field(..., min_length=1)
     dispatcher_reply: Optional[str] = "Help is on the Way: Mechanic dispatch en route to your coordinates."
     acknowledged_by: Optional[str] = "Dispatcher"
+
+class SosResolveRequest(BaseModel):
+    alert_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    driver_id: Optional[str] = None
+    truck_id: Optional[str] = None
+    load_slip_id: Optional[str] = None
+    resolved_by: Optional[str] = "Driver"
+    resolution_note: Optional[str] = "Driver confirmed safe / alert resolved."
 
 class UserAccountCreate(BaseModel):
     id: Optional[str] = None
@@ -361,7 +430,8 @@ class RouteOptimizeRequest(BaseModel):
     origin: LatLngModel
     destination: LatLngModel
     destination_id: Optional[str] = None
-    routing_preference: Optional[str] = "TRAFFIC_AWARE_OPTIMAL"
+    waypoints: Optional[List[LatLngModel]] = None
+    routing_preference: Optional[str] = "TRAFFIC_AWARE"
 
 class SyncTransactionItem(BaseModel):
     idempotency_key: str = Field(..., min_length=1)
@@ -625,6 +695,49 @@ def _recalculate_slip_totals_and_invoices(load_slip_id: str, fallback_driver_nam
     }
     updated = supabase.table("load_slips").update(update_slip).eq("id", load_slip_id).execute()
     return updated.data[0] if updated.data else {**slip, **update_slip}
+
+def _compute_slip_handover_summary(load_slip_id: str) -> Dict[str, Any]:
+    """Computes authoritative driver handover totals (Cash, Charge Invoice, Unsold Sacks) from load_slip_items."""
+    items_res = supabase.table("load_slip_items").select("*").eq("load_slip_id", load_slip_id).execute()
+    items = items_res.data or []
+
+    total_loaded = 0
+    total_delivered = 0
+    total_cash = Decimal("0.00")
+    total_charge = Decimal("0.00")
+    charge_count = 0
+    remitted_items = 0
+
+    for it in items:
+        planned = int(it.get("planned_qty") or 0)
+        delivered = int(it.get("delivered_qty") or 0)
+        total_loaded += planned
+        total_delivered += delivered
+
+        item_completed = (it.get("status") or "").lower() in ("completed", "partial") or it.get("delivered_at") is not None
+        if item_completed or delivered > 0:
+            remitted_items += 1
+            unit_price = Decimal(str(it.get("unit_price") or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            raw_total = Decimal(str(it.get("total_amount") or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            line_amount = (unit_price * Decimal(delivered)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if unit_price > 0 else raw_total
+            pay_mode = str(it.get("payment_mode") or "Cash").strip().lower()
+            if "charge" in pay_mode:
+                total_charge += line_amount
+                if delivered > 0 or line_amount > 0:
+                    charge_count += 1
+            else:
+                total_cash += line_amount
+
+    unsold_sacks = max(0, total_loaded - total_delivered)
+    return {
+        "total_cash": float(total_cash),
+        "total_charge_invoice": float(total_charge),
+        "charge_count": charge_count,
+        "total_loaded_sacks": total_loaded,
+        "total_delivered_sacks": total_delivered,
+        "unsold_sacks": unsold_sacks,
+        "remitted_items": remitted_items
+    }
 
 # --- SYSTEM & HEALTH ENDPOINTS ---
 
@@ -1735,7 +1848,13 @@ def finish_delivery_route(slip_id: str, req: Optional[FinishDeliveryRequest] = N
         slip = slip_res.data[0]
         curr_status = (slip.get("status") or "").upper()
         if curr_status in REMITTED_OR_DONE_STATUSES:
-            return {"status": "success", "message": "Load slip is already remitted.", "data": slip}
+            summary = _compute_slip_handover_summary(slip_id)
+            return {
+                "status": "success",
+                "message": "Load slip is already remitted.",
+                "data": slip,
+                "handover_summary": summary
+            }
 
         now_utc = datetime.now(timezone.utc).isoformat()
         supabase.table("load_slips").update({
@@ -1745,12 +1864,14 @@ def finish_delivery_route(slip_id: str, req: Optional[FinishDeliveryRequest] = N
         }).eq("id", slip_id).execute()
 
         updated = _recalculate_slip_totals_and_invoices(slip_id)
+        summary = _compute_slip_handover_summary(slip_id)
         log_audit("load_slips", slip_id, "FINISH_DELIVERY", (req.driver_id if req else None) or slip.get("driver_name") or "Driver")
 
         return {
             "status": "success",
             "message": "Delivery finished! Dispatch notified for Shift Closing & Remit.",
-            "data": updated
+            "data": updated,
+            "handover_summary": summary
         }
     except HTTPException:
         raise
@@ -1856,19 +1977,29 @@ def confirm_shift_remit(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- INVOICES & OFFICIAL RECEIPTS ---
+# --- INVOICES & OFFICIAL RECEIPTS (APPROVED / REMITTED ONLY) ---
+
+def _filter_approved_remitted_invoices(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    approved: List[Dict[str, Any]] = []
+    for row in rows:
+        slip_meta = row.get("load_slips") or {}
+        slip_status = str(row.get("load_slip_status") or slip_meta.get("status") or "").strip().upper()
+        inv_status = str(row.get("status") or "").strip()
+        if slip_status in APPROVED_RECEIPT_SLIP_STATUSES and inv_status != "Pending Delivery":
+            approved.append(row)
+    return approved
 
 @app.get("/api/v1/invoices")
 def list_invoices():
-    """Returns enriched itemized invoices & receipts with real truck, driver, and in-charge staff metadata."""
+    """Returns enriched itemized invoices & receipts strictly for officially remitted load slips."""
     try:
         try:
             res = supabase.table("receipts_view").select("*").order("created_at", desc=True).execute()
-            return {"status": "success", "data": res.data or []}
+            return {"status": "success", "data": _filter_approved_remitted_invoices(res.data or [])}
         except Exception:
             # Fallback before migration view exists
             res = supabase.table("invoices").select("*, load_slips(slip_number, truck_id, truck_plate, driver_name, in_charge_name, status)").is_("deleted_at", "null").order("created_at", desc=True).execute()
-            return {"status": "success", "data": res.data or []}
+            return {"status": "success", "data": _filter_approved_remitted_invoices(res.data or [])}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1903,11 +2034,50 @@ def settle_invoice(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- LIVE FLEET TELEMETRY AGGREGATION ---
+# --- SOS PERSISTENCE & LIVE FLEET TELEMETRY ---
+
+def _load_unresolved_sos_alerts() -> List[Dict[str, Any]]:
+    """Returns unresolved SOS alerts merged from Supabase sos_alerts table + in-memory cache."""
+    merged: Dict[str, Dict[str, Any]] = {}
+    for k, v in _active_sos_alerts.items():
+        if str(v.get("status") or "").strip().upper() not in RESOLVED_SOS_STATUSES:
+            merged[k] = dict(v)
+
+    try:
+        res = (
+            supabase.table("sos_alerts")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(100)
+            .execute()
+        )
+        for row in (res.data or []):
+            key = str(row.get("id") or row.get("idempotency_key") or "")
+            if not key:
+                continue
+            row_status = str(row.get("status") or "").strip().upper()
+            if row_status in RESOLVED_SOS_STATUSES:
+                merged.pop(key, None)
+                if key in _active_sos_alerts:
+                    _active_sos_alerts[key]["status"] = "RESOLVED"
+                    _active_sos_alerts[key]["resolved_at"] = row.get("resolved_at")
+            else:
+                merged[key] = row
+                _active_sos_alerts[key] = row
+    except Exception as sos_err:
+        # Table may not exist yet before SQL migration is run; fallback seamlessly to in-memory
+        print(f"[SOS TABLE NOTICE] {sos_err}")
+
+    alerts = [
+        a for a in merged.values()
+        if str(a.get("status") or "").strip().upper() not in RESOLVED_SOS_STATUSES
+    ]
+    alerts.sort(key=lambda a: str(a.get("created_at") or ""), reverse=True)
+    return alerts
 
 @app.get("/api/v1/telemetry/live")
 def get_live_fleet_telemetry():
-    """Aggregates live truck coordinates from gps_logs, active load slips, and active SOS alerts."""
+    """Aggregates live truck coordinates from gps_logs, active load slips, and unresolved SOS alerts."""
     try:
         slips_res = (
             supabase.table("load_slips")
@@ -1918,6 +2088,7 @@ def get_live_fleet_telemetry():
         )
         all_slips = slips_res.data or []
         active_slips = [s for s in all_slips if is_unremitted_status(s.get("status"))]
+        unresolved_sos = _load_unresolved_sos_alerts()
 
         gps_res = (
             supabase.table("gps_logs")
@@ -1950,7 +2121,7 @@ def get_live_fleet_telemetry():
             next_pending = next((it for it in items if (it.get("status") or "").lower() not in ("completed", "partial")), None)
 
             sos_match = next(
-                (a for a in _active_sos_alerts.values() if a.get("truck_id") == tid and a.get("status") == "Active"),
+                (a for a in unresolved_sos if a.get("truck_id") == tid and str(a.get("status") or "").upper() in ("ACTIVE", "ACKNOWLEDGED")),
                 None
             )
 
@@ -2183,8 +2354,7 @@ def save_gps_ping(ping: TelemetryPing):
 @app.get("/api/v1/telemetry/sos/active")
 @app.get("/telemetry/sos/active")
 def get_active_sos():
-    alerts = list(_active_sos_alerts.values())
-    alerts.sort(key=lambda a: a.get("created_at", ""), reverse=True)
+    alerts = _load_unresolved_sos_alerts()
     return {"status": "success", "alerts": alerts}
 
 @app.post("/api/v1/telemetry/sos")
@@ -2193,13 +2363,16 @@ def save_sos_alert(sos: EmergencySOSAlert):
     try:
         alert_id = sos.idempotency_key
         if alert_id in _active_sos_alerts:
-            return {"status": "success", "duplicate": True, "message": "SOS already logged.", "alert": _active_sos_alerts[alert_id]}
+            existing_alert = _active_sos_alerts[alert_id]
+            if str(existing_alert.get("status") or "").strip().upper() in RESOLVED_SOS_STATUSES:
+                return {"status": "success", "duplicate": True, "resolved": True, "message": "SOS already resolved.", "alert": existing_alert}
+            return {"status": "success", "duplicate": True, "message": "SOS already logged.", "alert": existing_alert}
 
         now_iso = datetime.now(timezone.utc).isoformat()
         alert_data = {
             "id": alert_id,
             "idempotency_key": sos.idempotency_key,
-            "load_slip_id": sos.load_slip_id,
+            "load_slip_id": sos.load_slip_id if is_uuid(sos.load_slip_id) else None,
             "driver_id": sos.driver_id,
             "driver_name": sos.driver_name or sos.driver_id,
             "truck_id": sos.truck_id,
@@ -2208,10 +2381,23 @@ def save_sos_alert(sos: EmergencySOSAlert):
             "reason": sos.reason,
             "status": "Active",
             "created_at": now_iso,
+            "updated_at": now_iso,
             "dispatcher_reply": None,
-            "acknowledged_by": None
+            "acknowledged_by": None,
+            "resolved_by": None,
+            "resolved_at": None
         }
         _active_sos_alerts[alert_id] = alert_data
+
+        try:
+            existing_sos = supabase.table("sos_alerts").select("*").eq("idempotency_key", sos.idempotency_key).limit(1).execute()
+            if existing_sos.data:
+                existing_row = existing_sos.data[0]
+                _active_sos_alerts[alert_id] = existing_row
+                return {"status": "success", "duplicate": True, "message": "SOS already logged.", "alert": existing_row}
+            supabase.table("sos_alerts").insert(alert_data).execute()
+        except Exception as sos_db_err:
+            print(f"[SOS_ALERTS INSERT NOTICE] {sos_db_err}")
 
         try:
             exists = supabase.table("gps_logs").select("id").eq("idempotency_key", sos.idempotency_key).limit(1).execute()
@@ -2236,28 +2422,135 @@ def save_sos_alert(sos: EmergencySOSAlert):
 @app.post("/api/v1/telemetry/sos/acknowledge")
 @app.post("/telemetry/sos/acknowledge")
 def acknowledge_sos_alert(req: SosAcknowledgeRequest):
-    alert = _active_sos_alerts.get(req.alert_id)
     now_iso = datetime.now(timezone.utc).isoformat()
     reply_msg = req.dispatcher_reply or "Help is on the Way: Support vehicle en route to your coordinates."
     ack_by = req.acknowledged_by or "Office Dispatcher"
 
+    alert = _active_sos_alerts.get(req.alert_id)
+    if not alert:
+        # Attempt hydrate from sos_alerts before creating placeholder
+        try:
+            db_res = supabase.table("sos_alerts").select("*").or_(f"id.eq.{req.alert_id},idempotency_key.eq.{req.alert_id}").limit(1).execute()
+            if db_res.data:
+                alert = db_res.data[0]
+        except Exception:
+            pass
+
     if alert:
+        if str(alert.get("status") or "").strip().upper() in RESOLVED_SOS_STATUSES:
+            return {"status": "success", "message": "SOS alert was already resolved.", "alert": alert}
         alert["status"] = "Acknowledged"
         alert["dispatcher_reply"] = reply_msg
         alert["acknowledged_by"] = ack_by
         alert["acknowledged_at"] = now_iso
-        log_audit("emergency_sos", req.alert_id, "SOS_ACKNOWLEDGED", ack_by, new_data=alert)
-        return {"status": "success", "message": "SOS alert acknowledged.", "alert": alert}
+        alert["updated_at"] = now_iso
+        _active_sos_alerts[req.alert_id] = alert
+    else:
+        alert = {
+            "id": req.alert_id,
+            "idempotency_key": req.alert_id,
+            "status": "Acknowledged",
+            "dispatcher_reply": reply_msg,
+            "acknowledged_by": ack_by,
+            "acknowledged_at": now_iso,
+            "updated_at": now_iso
+        }
+        _active_sos_alerts[req.alert_id] = alert
 
-    placeholder_alert = {
-        "id": req.alert_id,
-        "status": "Acknowledged",
-        "dispatcher_reply": reply_msg,
-        "acknowledged_by": ack_by,
-        "acknowledged_at": now_iso
+    try:
+        supabase.table("sos_alerts").update({
+            "status": "Acknowledged",
+            "dispatcher_reply": reply_msg,
+            "acknowledged_by": ack_by,
+            "acknowledged_at": now_iso,
+            "updated_at": now_iso
+        }).or_(f"id.eq.{req.alert_id},idempotency_key.eq.{req.alert_id}").execute()
+    except Exception as sos_ack_err:
+        print(f"[SOS_ALERTS ACK NOTICE] {sos_ack_err}")
+
+    log_audit("emergency_sos", req.alert_id, "SOS_ACKNOWLEDGED", ack_by, new_data=alert)
+    return {"status": "success", "message": "SOS alert acknowledged.", "alert": alert}
+
+@app.post("/api/v1/telemetry/sos/resolve")
+@app.post("/api/v1/telemetry/sos/dismiss")
+@app.post("/telemetry/sos/resolve")
+@app.post("/telemetry/sos/dismiss")
+def resolve_sos_alert(req: SosResolveRequest):
+    """Permanently marks matching active/acknowledged SOS alerts as RESOLVED in DB and memory."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    resolved_by = req.resolved_by or "Driver"
+    target_key = req.alert_id or req.idempotency_key
+    resolved_count = 0
+
+    for k, a in list(_active_sos_alerts.items()):
+        if str(a.get("status") or "").strip().upper() in RESOLVED_SOS_STATUSES:
+            continue
+        match_id = bool(target_key and (k == target_key or a.get("id") == target_key or a.get("idempotency_key") == target_key))
+        match_truck = bool(req.truck_id and a.get("truck_id") == req.truck_id)
+        match_driver = bool(req.driver_id and a.get("driver_id") == req.driver_id)
+        match_slip = bool(req.load_slip_id and a.get("load_slip_id") == req.load_slip_id)
+
+        if match_id or match_truck or match_driver or match_slip:
+            a["status"] = "RESOLVED"
+            a["resolved_by"] = resolved_by
+            a["resolved_at"] = now_iso
+            a["updated_at"] = now_iso
+            if req.resolution_note:
+                a["resolution_note"] = req.resolution_note
+            resolved_count += 1
+
+    try:
+        db_update = {
+            "status": "RESOLVED",
+            "resolved_by": resolved_by,
+            "resolved_at": now_iso,
+            "updated_at": now_iso
+        }
+        if target_key:
+            r1 = (
+                supabase.table("sos_alerts")
+                .update(db_update)
+                .or_(f"id.eq.{target_key},idempotency_key.eq.{target_key}")
+                .execute()
+            )
+            if r1.data:
+                resolved_count = max(resolved_count, len(r1.data))
+        if req.truck_id:
+            r2 = (
+                supabase.table("sos_alerts")
+                .update(db_update)
+                .eq("truck_id", req.truck_id)
+                .in_("status", ["Active", "Acknowledged", "active", "acknowledged"])
+                .execute()
+            )
+            if r2.data:
+                resolved_count = max(resolved_count, len(r2.data))
+        if req.driver_id:
+            r3 = (
+                supabase.table("sos_alerts")
+                .update(db_update)
+                .eq("driver_id", req.driver_id)
+                .in_("status", ["Active", "Acknowledged", "active", "acknowledged"])
+                .execute()
+            )
+            if r3.data:
+                resolved_count = max(resolved_count, len(r3.data))
+    except Exception as sos_res_err:
+        print(f"[SOS_ALERTS RESOLVE NOTICE] {sos_res_err}")
+
+    log_audit(
+        "emergency_sos",
+        target_key or req.truck_id or req.driver_id or "sos",
+        "SOS_RESOLVED",
+        resolved_by,
+        new_data={"resolved_at": now_iso, "truck_id": req.truck_id, "driver_id": req.driver_id}
+    )
+    return {
+        "status": "success",
+        "resolved_count": resolved_count,
+        "resolved_at": now_iso,
+        "message": "SOS alert resolved cleanly."
     }
-    _active_sos_alerts[req.alert_id] = placeholder_alert
-    return {"status": "success", "message": "SOS alert acknowledged.", "alert": placeholder_alert}
 
 # --- IDEMPOTENT OFFLINE BATCH SYNC ---
 
@@ -2379,15 +2672,24 @@ def sync_offline_batch(payload: BatchSyncPayload):
 
 @app.post("/api/v1/routes/optimize")
 async def optimize_route(req: RouteOptimizeRequest):
+    waypoints_str = "|".join(
+        f"{w.latitude:.5f},{w.longitude:.5f}" for w in (req.waypoints or [])
+    )
+    pref_raw = (req.routing_preference or "TRAFFIC_AWARE").strip().upper()
+    routing_pref = (
+        pref_raw
+        if pref_raw in ("TRAFFIC_AWARE", "TRAFFIC_AWARE_OPTIMAL", "TRAFFIC_UNAWARE")
+        else "TRAFFIC_AWARE"
+    )
     cache_key = get_route_cache_key(
-        f"{req.origin.latitude},{req.origin.longitude}",
-        f"{req.destination.latitude},{req.destination.longitude}"
+        f"{req.origin.latitude:.4f},{req.origin.longitude:.4f}",
+        f"{req.destination.latitude:.4f},{req.destination.longitude:.4f}|{waypoints_str}|{routing_pref}"
     )
     now = time.time()
 
     if cache_key in _route_cache:
         cached_ts, cached_payload = _route_cache[cache_key]
-        if now - cached_ts < ROUTE_CACHE_TTL_SECONDS:
+        if now - cached_ts < ROUTE_CACHE_TTL_SECONDS and not cached_payload.get("isFallback"):
             return cached_payload
 
     if GOOGLE_ROUTES_KEY and not GOOGLE_ROUTES_KEY.startswith("your_"):
@@ -2396,61 +2698,106 @@ async def optimize_route(req: RouteOptimizeRequest):
             headers = {
                 "Content-Type": "application/json",
                 "X-Goog-Api-Key": GOOGLE_ROUTES_KEY,
-                "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline,routes.legs.steps"
+                "X-Goog-FieldMask": "routes.polyline.encodedPolyline,routes.duration,routes.distanceMeters,routes.legs,routes.optimizedIntermediateWaypointIndex"
             }
-            body = {
-                "origin": {"location": {"latLng": {"latitude": req.origin.latitude, "longitude": req.origin.longitude}}},
-                "destination": {"location": {"latLng": {"latitude": req.destination.latitude, "longitude": req.destination.longitude}}},
+            body: Dict[str, Any] = {
+                "origin": {
+                    "location": {
+                        "latLng": {
+                            "latitude": req.origin.latitude,
+                            "longitude": req.origin.longitude
+                        }
+                    }
+                },
+                "destination": {
+                    "location": {
+                        "latLng": {
+                            "latitude": req.destination.latitude,
+                            "longitude": req.destination.longitude
+                        }
+                    }
+                },
                 "travelMode": "DRIVE",
-                "routingPreference": req.routing_preference or "TRAFFIC_AWARE_OPTIMAL",
+                "routingPreference": routing_pref,
                 "computeAlternativeRoutes": False
             }
+            if req.waypoints:
+                body["intermediates"] = [
+                    {
+                        "location": {
+                            "latLng": {
+                                "latitude": wp.latitude,
+                                "longitude": wp.longitude
+                            }
+                        }
+                    }
+                    for wp in req.waypoints
+                ]
+                if len(req.waypoints) > 1:
+                    body["optimizeWaypointOrder"] = True
 
-            async with httpx.AsyncClient(timeout=6.0) as client:
+            async with httpx.AsyncClient(timeout=8.0) as client:
                 res = await client.post(routes_url, headers=headers, json=body)
                 if res.status_code == 200:
                     data = res.json()
-                    route = data.get("routes", [{}])[0]
-                    dist = route.get("distanceMeters", 3500)
-                    dur_str = route.get("duration", "480s").replace("s", "")
-                    dur = int(dur_str) if dur_str.isdigit() else 480
+                    routes_list = data.get("routes") or []
+                    if not routes_list:
+                        print(f"[ROUTES API WARNING] HTTP 200 but empty routes array: {data}")
+                    else:
+                        route = routes_list[0]
+                        encoded_polyline = route.get("polyline", {}).get("encodedPolyline", "")
+                        decoded_points = decode_polyline(encoded_polyline)
+                        dist = int(route.get("distanceMeters") or 0)
+                        dur = _duration_to_seconds(route.get("duration"), 480)
 
-                    steps_raw = route.get("legs", [{}])[0].get("steps", [])
-                    steps_formatted = []
-                    for idx, s in enumerate(steps_raw):
-                        nav_inst = s.get("navigationInstruction", {})
-                        steps_formatted.append({
-                            "stepIndex": idx,
-                            "instruction": nav_inst.get("instructions", "Continue along CDO corridor"),
-                            "maneuver": nav_inst.get("maneuver", "straight").lower().replace("_", "-"),
-                            "distanceMeters": s.get("distanceMeters", 500),
-                            "durationSeconds": int(s.get("staticDuration", "60s").replace("s", "")) if s.get("staticDuration", "").replace("s", "").isdigit() else 60,
-                            "startLocation": {
-                                "latitude": s.get("startLocation", {}).get("latLng", {}).get("latitude", req.origin.latitude),
-                                "longitude": s.get("startLocation", {}).get("latLng", {}).get("longitude", req.origin.longitude)
-                            },
-                            "endLocation": {
-                                "latitude": s.get("endLocation", {}).get("latLng", {}).get("latitude", req.destination.latitude),
-                                "longitude": s.get("endLocation", {}).get("latLng", {}).get("longitude", req.destination.longitude)
+                        legs = route.get("legs") or []
+                        steps_formatted = []
+                        step_counter = 0
+                        for leg in legs:
+                            for s in (leg.get("steps") or []):
+                                nav_inst = s.get("navigationInstruction") or {}
+                                step_start = (s.get("startLocation") or {}).get("latLng") or {}
+                                step_end = (s.get("endLocation") or {}).get("latLng") or {}
+                                steps_formatted.append({
+                                    "stepIndex": step_counter,
+                                    "instruction": nav_inst.get("instructions") or "Continue along CDO corridor",
+                                    "maneuver": str(nav_inst.get("maneuver") or "straight").lower().replace("_", "-"),
+                                    "distanceMeters": int(s.get("distanceMeters") or 0),
+                                    "durationSeconds": _duration_to_seconds(s.get("staticDuration"), 60),
+                                    "startLocation": {
+                                        "latitude": float(step_start.get("latitude", req.origin.latitude)),
+                                        "longitude": float(step_start.get("longitude", req.origin.longitude))
+                                    },
+                                    "endLocation": {
+                                        "latitude": float(step_end.get("latitude", req.destination.latitude)),
+                                        "longitude": float(step_end.get("longitude", req.destination.longitude))
+                                    }
+                                })
+                                step_counter += 1
+
+                        if len(decoded_points) >= 2:
+                            formatted_payload = {
+                                "routeId": f"GOOGLE-{cache_key[:8]}",
+                                "destinationId": req.destination_id or "DEST",
+                                "destinationName": "CDO Delivery Stop",
+                                "totalDistanceMeters": dist,
+                                "totalDurationSeconds": dur,
+                                "encodedPolyline": encoded_polyline,
+                                "overviewPolyline": decoded_points,
+                                "optimizedIntermediateWaypointIndex": route.get("optimizedIntermediateWaypointIndex"),
+                                "steps": steps_formatted,
+                                "isFallback": False
                             }
-                        })
-
-                    formatted_payload = {
-                        "routeId": f"GOOGLE-{cache_key[:8]}",
-                        "destinationId": req.destination_id or "DEST",
-                        "destinationName": "CDO Delivery Stop",
-                        "totalDistanceMeters": dist,
-                        "totalDurationSeconds": dur,
-                        "overviewPolyline": [
-                            {"latitude": req.origin.latitude, "longitude": req.origin.longitude},
-                            {"latitude": req.destination.latitude, "longitude": req.destination.longitude}
-                        ],
-                        "steps": steps_formatted
-                    }
-                    _route_cache[cache_key] = (now, formatted_payload)
-                    return formatted_payload
+                            _route_cache[cache_key] = (now, formatted_payload)
+                            return formatted_payload
+                        else:
+                            print("[ROUTES API WARNING] Decoded polyline had <2 points; falling back.")
+                else:
+                    print(f"[ROUTES API ERROR] HTTP {res.status_code}: {res.text[:500]}")
         except Exception as err:
-            print(f"Routes API call error, falling back to CDO route: {err}")
+            print(f"[ROUTES API EXCEPTION] Falling back to offline CDO corridor: {err}")
+    else:
+        print("[ROUTES API CONFIG NOTICE] GOOGLE_ROUTES_SERVER_KEY / GOOGLE_ROUTES_API_KEY not configured.")
 
     fallback_payload = {
         "routeId": f"CDO-{cache_key[:8]}",
@@ -2458,11 +2805,13 @@ async def optimize_route(req: RouteOptimizeRequest):
         "destinationName": "Cagayan de Oro Corridor",
         "totalDistanceMeters": 3500,
         "totalDurationSeconds": 480,
+        "encodedPolyline": "",
         "overviewPolyline": [
             {"latitude": req.origin.latitude, "longitude": req.origin.longitude},
             {"latitude": (req.origin.latitude + req.destination.latitude) / 2, "longitude": (req.origin.longitude + req.destination.longitude) / 2},
             {"latitude": req.destination.latitude, "longitude": req.destination.longitude}
         ],
+        "isFallback": True,
         "steps": [
             {
                 "stepIndex": 0,
@@ -2493,5 +2842,4 @@ async def optimize_route(req: RouteOptimizeRequest):
             }
         ]
     }
-    _route_cache[cache_key] = (now, fallback_payload)
     return fallback_payload
